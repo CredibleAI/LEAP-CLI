@@ -33,6 +33,7 @@ depends on.
 from typing import Tuple
 
 import lean_code_parser as models
+import lean_verifier_tool
 import pipeline
 import review_trigger
 
@@ -277,8 +278,31 @@ def declare(mgr, node_id: str, action: str, reason: str) -> Tuple[bool, str]:
     # as "the compiler's own output".
     mgr._write_node_log(node_id, reason, "note")  # pylint: disable=protected-access
     mgr._clear_claim_metadata(node)  # pylint: disable=protected-access
+    phase_after = pipeline.current_phase_name(node)
+    event_fields = {
+        "node_id": node_id,
+        "action": action,
+        "phase_before": phase.name,
+        "phase_after": phase_after,
+        "revision": node.search_metadata["revision"],
+    }
+    lean_verifier_tool._append_event(  # pylint: disable=protected-access
+        "leap_action_recorded", **event_fields
+    )
+    if action == "planned":
+      lean_verifier_tool._append_event(  # pylint: disable=protected-access
+          "leap_plan_recorded", **event_fields
+      )
+    if phase.name == pipeline.REVIEW_PHASE:
+      lean_verifier_tool._append_event(  # pylint: disable=protected-access
+          "leap_review_recorded", **event_fields
+      )
+    if action == "replan":
+      lean_verifier_tool._append_event(  # pylint: disable=protected-access
+          "leap_replan_recorded", **event_fields
+      )
 
-    return True, _recorded(node_id, action, pipeline.current_phase_name(node))
+    return True, _recorded(node_id, action, phase_after)
 
 
 def node_report(mgr, node_id: str) -> Tuple[bool, str]:

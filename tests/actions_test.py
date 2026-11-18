@@ -19,8 +19,10 @@ decomposition to retire.
 """
 
 import _path  # noqa: F401  (puts leap/ on sys.path)
+import json
 import os
 import tempfile
+from unittest import mock
 
 from absl.testing import absltest
 
@@ -227,6 +229,44 @@ class RecordedTest(ActionsTestCase):
 
   def test_the_reply_tells_the_agent_to_stop(self):
     self.assertIn("conclude your turn", self.declare("planned")[1])
+
+  def test_planned_action_emits_stable_experiment_events(self):
+    event_log = os.path.join(self.root_dir, "events.jsonl")
+    with mock.patch.dict(os.environ, {
+        "LEAP_EVENT_LOG": event_log,
+        "LEAP_CAMPAIGN_ID": "campaign",
+        "LEAP_WAVE_ID": "wave",
+        "LEAP_CELL_ID": "cell",
+    }):
+      self.assertTrue(self.declare("planned")[0])
+    with open(event_log, encoding="utf-8") as stream:
+      events = [json.loads(line) for line in stream]
+    self.assertEqual(
+        [event["event"] for event in events],
+        ["leap_action_recorded", "leap_plan_recorded"],
+    )
+    self.assertEqual({event["cell_id"] for event in events}, {"cell"})
+    self.assertEqual({event["action"] for event in events}, {"planned"})
+    self.assertEqual({event["phase_before"] for event in events}, {"informal"})
+    self.assertEqual({event["phase_after"] for event in events}, {"formal"})
+    self.assertEqual(len({event["event_id"] for event in events}), 2)
+
+  def test_review_replan_emits_both_review_and_replan_events(self):
+    self.set_phase("review")
+    event_log = os.path.join(self.root_dir, "review-events.jsonl")
+    with mock.patch.dict(os.environ, {
+        "LEAP_EVENT_LOG": event_log,
+        "LEAP_CAMPAIGN_ID": "campaign",
+        "LEAP_WAVE_ID": "wave",
+        "LEAP_CELL_ID": "cell",
+    }):
+      self.assertTrue(self.declare("replan")[0])
+    with open(event_log, encoding="utf-8") as stream:
+      events = [json.loads(line) for line in stream]
+    self.assertEqual(
+        [event["event"] for event in events],
+        ["leap_action_recorded", "leap_review_recorded", "leap_replan_recorded"],
+    )
 
   def test_the_claim_is_released(self):
     self.hold()
