@@ -487,15 +487,35 @@ def _append_event(event: str, **fields: Any) -> None:
 
 
 @contextmanager
-def _global_lean_admission():
-  """Acquires one Slurm-job-wide file-lock slot for a local Lean process."""
+def _global_lean_admission(
+    *, check_id: Optional[str] = None, check_kind: str = "unspecified"
+):
+  """Acquires one Slurm-job-wide file-lock slot for one identified Lean check."""
+  if check_id is None:
+    identity = f"{check_kind}/{time.time_ns()}/{os.getpid()}"
+    check_id = "lean-check-" + hashlib.sha256(identity.encode()).hexdigest()
+  common = {"lean_check_id": check_id, "check_kind": check_kind}
+  queued = time.monotonic()
+  _append_event("lean_check_enqueued", **common)
   slot_dir = os.environ.get("LEAP_LEAN_SLOT_DIR", "")
   limit = int(os.environ.get("LEAP_MAX_LEAN_CHECKS", "0") or 0)
   if not slot_dir or limit <= 0 or fcntl is None:
-    yield {"slot": None, "queue_wait_seconds": 0.0}
+    acquired = time.monotonic()
+    waited = acquired - queued
+    _append_event(
+        "lean_slot_acquired", slot=None, queue_wait_seconds=waited, **common
+    )
+    try:
+      yield {"slot": None, "queue_wait_seconds": waited, **common}
+    finally:
+      _append_event(
+          "lean_slot_released",
+          slot=None,
+          held_seconds=time.monotonic() - acquired,
+          **common,
+      )
     return
   os.makedirs(slot_dir, exist_ok=True)
-  queued = time.monotonic()
   while True:
     for slot in range(limit):
       handle = open(  # pylint: disable=consider-using-with
@@ -506,12 +526,20 @@ def _global_lean_admission():
       except BlockingIOError:
         handle.close()
         continue
-      waited = time.monotonic() - queued
-      _append_event("lean_slot_acquired", slot=slot, queue_wait_seconds=waited)
+      acquired = time.monotonic()
+      waited = acquired - queued
+      _append_event(
+          "lean_slot_acquired", slot=slot, queue_wait_seconds=waited, **common
+      )
       try:
-        yield {"slot": slot, "queue_wait_seconds": waited}
+        yield {"slot": slot, "queue_wait_seconds": waited, **common}
       finally:
-        _append_event("lean_slot_released", slot=slot)
+        _append_event(
+            "lean_slot_released",
+            slot=slot,
+            held_seconds=time.monotonic() - acquired,
+            **common,
+        )
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
       return
@@ -652,8 +680,33 @@ def run_lean_verifier(input_data: LeanVerifierInput) -> LeanVerifierOutput:
           ),
           remote_error=remote_err,
       )
-    with _global_lean_admission():
+    check_kind = (
+        "compile_and_axiom_audit" if input_data.target_name else "compile"
+    )
+    code_sha256 = hashlib.sha256(code.encode()).hexdigest()
+    started = time.monotonic()
+    with _global_lean_admission(check_kind=check_kind) as admission:
       res, last_err = _check_local(code, input_data.timeout)
+    if res is None:
+      outcome = "infrastructure_failure"
+    elif res.get("error"):
+      outcome = "timeout"
+    else:
+      messages = (res.get("response") or {}).get("messages", [])
+      outcome = (
+          "compiler_rejection"
+          if any(message.get("severity") == "error" for message in messages)
+          else "passed"
+      )
+    _append_event(
+        "lean_check_finished",
+        lean_check_id=admission["lean_check_id"],
+        check_kind=check_kind,
+        code_sha256=code_sha256,
+        command_duration_seconds=time.monotonic() - started,
+        outcome=outcome,
+        backend="local",
+    )
 
   if res is None:
     # No verdict was obtained, so this says nothing about the proof.

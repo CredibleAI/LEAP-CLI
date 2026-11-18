@@ -24,7 +24,9 @@ class GlobalLeanAdmissionTest(unittest.TestCase):
 
       def held():
         nonlocal active, peak
-        with lean_verifier_tool._global_lean_admission():
+        with lean_verifier_tool._global_lean_admission(
+            check_kind="compile", check_id=f"check-{threading.get_ident()}"
+        ):
           with lock:
             active += 1
             peak = max(peak, active)
@@ -51,18 +53,24 @@ class GlobalLeanAdmissionTest(unittest.TestCase):
           json.loads(line)
           for line in Path(event_log).read_text(encoding="utf-8").splitlines()
       ]
-      self.assertEqual(
-          [event["event"] for event in events],
-          [
-              "lean_slot_acquired",
-              "lean_slot_released",
-              "lean_slot_acquired",
-              "lean_slot_released",
-          ],
-      )
-      self.assertGreater(events[2]["queue_wait_seconds"], 0)
-      self.assertEqual(len({event["event_id"] for event in events}), 4)
+      names = [event["event"] for event in events]
+      self.assertEqual(names.count("lean_check_enqueued"), 2)
+      self.assertEqual(names.count("lean_slot_acquired"), 2)
+      self.assertEqual(names.count("lean_slot_released"), 2)
+      acquired = [event for event in events if event["event"] == "lean_slot_acquired"]
+      released = [event for event in events if event["event"] == "lean_slot_released"]
+      self.assertGreater(max(event["queue_wait_seconds"] for event in acquired), 0)
+      self.assertTrue(all(event["held_seconds"] > 0 for event in released))
+      self.assertEqual(len({event["event_id"] for event in events}), 6)
       self.assertTrue(all(event["wave_id"] == "wave" for event in events))
+      self.assertTrue(all(event["check_kind"] == "compile" for event in events))
+      check_ids = {event["lean_check_id"] for event in events}
+      self.assertEqual(len(check_ids), 2)
+      for check_id in check_ids:
+        self.assertEqual(
+            [event["event"] for event in events if event["lean_check_id"] == check_id],
+            ["lean_check_enqueued", "lean_slot_acquired", "lean_slot_released"],
+        )
 
 
 if __name__ == "__main__":

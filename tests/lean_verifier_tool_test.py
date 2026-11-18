@@ -420,6 +420,34 @@ class LocalBackendTest(absltest.TestCase):
     self.assertEqual(out.used_axioms, ["propext"])
     self.assertEqual(run.call_args.args[0][1:4], ["env", "lean", "--json"])
 
+  def test_local_check_emits_kind_duration_and_outcome(self):
+    msg = {"severity": "information", "data": "'t' does not depend on any axioms"}
+    with tempfile.TemporaryDirectory() as root:
+      event_log = os.path.join(root, "events.jsonl")
+      with mock.patch.dict(os.environ, {"LEAP_EVENT_LOG": event_log}, clear=False):
+        out, _ = self._run(json.dumps(msg) + "\n")
+      self.assertTrue(out.is_valid)
+      with open(event_log, encoding="utf-8") as stream:
+        events = [json.loads(line) for line in stream]
+    self.assertEqual(
+        [event["event"] for event in events],
+        [
+            "lean_check_enqueued",
+            "lean_slot_acquired",
+            "lean_slot_released",
+            "lean_check_finished",
+        ],
+    )
+    self.assertTrue(
+        all(
+            event["check_kind"] == "compile_and_axiom_audit"
+            for event in events
+        )
+    )
+    self.assertEqual(events[-1]["outcome"], "passed")
+    self.assertGreaterEqual(events[-1]["command_duration_seconds"], 0)
+    self.assertEqual(len({event["lean_check_id"] for event in events}), 1)
+
   def test_error_message_is_a_rejection_not_infra(self):
     msg = {"severity": "error", "pos": {"line": 3, "column": 2},
            "data": "unknown identifier 'foo'"}
