@@ -35,6 +35,7 @@ Usage (CLI):
 
 import asyncio
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 import re
@@ -458,11 +459,22 @@ def _append_event(event: str, **fields: Any) -> None:
   path = os.environ.get("LEAP_EVENT_LOG", "")
   if not path:
     return
+  timestamp_ns = time.time_ns()
+  identity = "/".join((
+      os.environ.get("LEAP_CAMPAIGN_ID", ""),
+      os.environ.get("LEAP_WAVE_ID", ""),
+      os.environ.get("LEAP_CELL_ID", ""),
+      event,
+      str(timestamp_ns),
+      str(os.getpid()),
+  ))
   row = {
       "schema_version": "putnam_leap_event_v1",
+      "event_id": "event-" + hashlib.sha256(identity.encode()).hexdigest(),
       "event": event,
-      "timestamp_unix": time.time(),
+      "timestamp_unix": timestamp_ns / 1_000_000_000,
       "campaign_id": os.environ.get("LEAP_CAMPAIGN_ID", ""),
+      "wave_id": os.environ.get("LEAP_WAVE_ID", ""),
       "cell_id": os.environ.get("LEAP_CELL_ID", ""),
       **fields,
   }

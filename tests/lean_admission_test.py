@@ -37,6 +37,7 @@ class GlobalLeanAdmissionTest(unittest.TestCase):
           "LEAP_MAX_LEAN_CHECKS": "1",
           "LEAP_EVENT_LOG": event_log,
           "LEAP_CAMPAIGN_ID": "campaign",
+          "LEAP_WAVE_ID": "wave",
           "LEAP_CELL_ID": "cell",
       }
       with mock.patch.dict(os.environ, env, clear=False):
@@ -60,6 +61,8 @@ class GlobalLeanAdmissionTest(unittest.TestCase):
           ],
       )
       self.assertGreater(events[2]["queue_wait_seconds"], 0)
+      self.assertEqual(len({event["event_id"] for event in events}), 4)
+      self.assertTrue(all(event["wave_id"] == "wave" for event in events))
 
 
 if __name__ == "__main__":
