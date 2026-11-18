@@ -436,9 +436,21 @@ create, edit and delete.
       header = models.build_disproof_header(header, target_sig)
       target_sig = models.disproof_obligation(node_id)
 
+    required_definitions = ""
+    if (
+        node_id == graph.graph_metadata.get("root_id")
+        and not any(
+            block.node_id == node_id and not block.retired
+            for block in graph.environment.dynamic_headers
+        )
+    ):
+      required_definitions = str(
+          graph.graph_metadata.get("required_definitions") or ""
+      ).strip()
+
     return models.build_lean_scaffold(
         immutable_context=header,
-        definitions="",
+        definitions=required_definitions,
         subgoals="",
         proof=f"{target_sig} :=\nby\n  sorry",
         role=role,

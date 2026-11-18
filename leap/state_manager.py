@@ -149,6 +149,25 @@ try:
   _STATEMENT = _def_flag(
       "statement", flags.DEFINE_string, None, "Statement string for init_graph."
   )
+  _ROOT_PHASE = _def_flag(
+      "root_phase",
+      flags.DEFINE_enum,
+      "informal",
+      ["informal", "formal"],
+      "Initial root phase. Use formal to bypass root planning.",
+  )
+  _REQUIRED_DEFINITIONS = _def_flag(
+      "required_definitions",
+      flags.DEFINE_string,
+      "",
+      "Root definition templates whose signatures must be completed exactly.",
+  )
+  _FREEZE_ROOT_PLAN = _def_flag(
+      "freeze_root_plan",
+      flags.DEFINE_boolean,
+      False,
+      "Keep root replans in the formal phase after the first plan is frozen.",
+  )
   _REASON = _def_flag(
       "reason",
       flags.DEFINE_string,
@@ -282,6 +301,24 @@ class StateManagerInput(pydantic.BaseModel):
   statement: Optional[str] = pydantic.Field(
       default=None,
       description="Problem statement string used solely for init_graph.",
+  )
+  root_phase: str = pydantic.Field(
+      default="informal",
+      description="Initial root phase: informal (normal) or formal (no root plan).",
+  )
+  required_definitions: str = pydantic.Field(
+      default="",
+      description=(
+          "Root definition templates. Their declaration signatures are immutable;"
+          " agents must replace only their bodies."
+      ),
+  )
+  freeze_root_plan: bool = pydantic.Field(
+      default=False,
+      description=(
+          "Keep root-level replan actions in formal proving so a frozen external"
+          " blueprint cannot be replaced. Child replans remain enabled."
+      ),
   )
   reason: str = pydantic.Field(
       default="",
@@ -1010,6 +1047,69 @@ def _retired_header_references(
   return RecordMessages.header_retracted(hits)
 
 
+def _required_definition_templates(
+    graph: dag.ProofGraph, node_id: str
+) -> List[str]:
+  """Returns root definition templates that have not been committed yet."""
+  root_id = graph.graph_metadata.get("root_id")
+  required = str(graph.graph_metadata.get("required_definitions") or "").strip()
+  if not required or node_id != root_id:
+    return []
+  templates = models.split_declarations(required)
+  required_names = {
+      models.extract_declaration_name(decl) for decl in templates
+  }
+  committed_names = set()
+  for block in graph.environment.dynamic_headers:
+    if block.retired or block.node_id != node_id:
+      continue
+    committed_names.update(
+        models.extract_declaration_name(decl)
+        for decl in models.split_declarations(block.content or "")
+    )
+  if required_names and required_names.issubset(committed_names):
+    return []
+  return templates
+
+
+def _validate_required_definitions(
+    graph: dag.ProofGraph, node_id: str, definitions_block: str
+) -> Optional[str]:
+  """Requires exact declaration signatures while leaving bodies agent-authored."""
+  templates = _required_definition_templates(graph, node_id)
+  if not templates:
+    return None
+  actual = {
+      models.extract_declaration_name(decl): decl
+      for decl in models.split_declarations(definitions_block or "")
+      if models.extract_declaration_name(decl)
+  }
+  missing = []
+  changed = []
+  for template in templates:
+    name = models.extract_declaration_name(template)
+    if not name or name not in actual:
+      missing.append(name or "<unnamed>")
+      continue
+    expected_signature, _ = models.split_signature_and_proof(template)
+    actual_signature, _ = models.split_signature_and_proof(actual[name])
+    if models.normalize_string(expected_signature) != models.normalize_string(
+        actual_signature
+    ):
+      changed.append(name)
+  if not missing and not changed:
+    return None
+  details = []
+  if missing:
+    details.append("missing: " + ", ".join(sorted(missing)))
+  if changed:
+    details.append("signature changed: " + ", ".join(sorted(changed)))
+  return (
+      "REQUIRED ROOT DEFINITIONS REJECTED (" + "; ".join(details) + "). "
+      "Keep every required declaration signature exact and replace only its body."
+  )
+
+
 def _validate_definitions_block(
     graph: dag.ProofGraph, node_id: str, definitions_block: str
 ) -> Optional[str]:
@@ -1460,6 +1560,8 @@ class ProofGraphStateManager:
       if not target_root or target_root not in graph.nodes:
         return None
 
+      if graph.graph_metadata.get("terminal_state"):
+        return None
       status_map = graph.propagate_failures()
       now = time.time()
       visited = set()
@@ -2205,6 +2307,36 @@ class ProofGraphStateManager:
 
     return snapshot, node.search_metadata.get("revision", 0), None
 
+  def _admit_formal_submission(self, node_id: str) -> Tuple[bool, str]:
+    """Atomically counts and bounds proposal-equivalent kernel submissions."""
+    limit = int(os.environ.get("LEAP_MAX_FORMAL_SUBMISSIONS", "0") or 0)
+    with self.lock_and_modify() as graph:
+      count = int(graph.graph_metadata.get("formal_submission_count", 0))
+      if limit > 0 and count >= limit:
+        graph.graph_metadata.update(
+            terminal_state="budget_exhausted",
+            terminal_reason=(
+                f"formal submission ceiling {limit} reached before {node_id}"
+            ),
+        )
+        node = graph.nodes.get(node_id)
+        if node is not None:
+          self._clear_claim_metadata(node)
+        return False, (
+            f"BUDGET EXHAUSTED: the trajectory used all {limit} kernel-checked"
+            " formal submissions. The claim was released and no Lean check ran."
+        )
+      count += 1
+      graph.graph_metadata["formal_submission_count"] = count
+    lean_verifier_tool._append_event(  # pylint: disable=protected-access
+        "formal_submission_admitted",
+        node_id=node_id,
+        formal_submission_count=count,
+        formal_submission_limit=limit or None,
+    )
+    return True, ""
+
+
   def _commit_submission(
       self,
       node_id: str,
@@ -2263,9 +2395,13 @@ class ProofGraphStateManager:
       # declarations would land in to_lean_header, and -- dynamic_headers being
       # append-only (D1) -- every later compile on every node would fail with no
       # recovery short of hand-editing proof_graph.json.
-      defs_err = _validate_definitions_block(
-          graph, node_id, definitions_block
-      ) or _retired_header_references(graph, outcome, definitions_block)
+      defs_err = (
+          _validate_definitions_block(graph, node_id, definitions_block)
+          or _validate_required_definitions(graph, node_id, definitions_block)
+          or _retired_header_references(
+              graph, outcome, definitions_block
+          )
+      )
       if defs_err:
         return self._finalize_failure(node, defs_err, is_decomp)
 
@@ -2334,11 +2470,21 @@ class ProofGraphStateManager:
       return early
     assert snapshot is not None
 
-    gate_err = _validate_proof_syntactic_gates(
-        snapshot.nodes[node_id], proof_tactics, definitions_block
-    ) or _validate_definitions_block(snapshot, node_id, definitions_block)
+    gate_err = (
+        _validate_proof_syntactic_gates(
+            snapshot.nodes[node_id], proof_tactics, definitions_block
+        )
+        or _validate_definitions_block(snapshot, node_id, definitions_block)
+        or _validate_required_definitions(
+            snapshot, node_id, definitions_block
+        )
+    )
     if gate_err:
       return self._reject(node_id, gate_err, is_decomp=False)
+
+    admitted, message = self._admit_formal_submission(node_id)
+    if not admitted:
+      return True, message
 
     # --- PHASE D: Lean Kernel Verification (UNLOCKED) ---
     try:
@@ -2392,9 +2538,15 @@ class ProofGraphStateManager:
 
     defs_err = _validate_definitions_block(
         snapshot, parent_id, definitions_block
+    ) or _validate_required_definitions(
+        snapshot, parent_id, definitions_block
     )
     if defs_err:
       return self._reject(parent_id, defs_err, is_decomp=True)
+
+    admitted, message = self._admit_formal_submission(parent_id)
+    if not admitted:
+      return True, message
 
     # --- PHASE D: Lean Kernel Verification (UNLOCKED) ---
     try:
@@ -2480,6 +2632,10 @@ class ProofGraphStateManager:
           node_id, RecordMessages.signature_mismatch(obligation),
           is_decomp=False,
       )
+
+    admitted, message = self._admit_formal_submission(node_id)
+    if not admitted:
+      return True, message
 
     assembled = models.build_lean_scaffold(
         immutable_context=models.build_disproof_header(
@@ -3228,10 +3384,71 @@ def _handle_init_graph(
   if not re.search(r"^(?:@\[[^\]]*\]\s+)?(?:noncomputable\s+)?(?:theorem|lemma)\b", root_stmt):
     root_stmt = f"theorem {root_id} : {root_stmt}"
 
+  root_phase = input_data.root_phase
+  if root_phase not in ("informal", "formal"):
+    return StateManagerOutput(
+        success=False,
+        action=action,
+        error_message="root_phase must be informal or formal.",
+    )
+
+  required_definitions = input_data.required_definitions.strip()
+  required_declarations = models.split_declarations(required_definitions)
+  required_names = []
+  for declaration in required_declarations:
+    keyword = models.extract_declaration_keyword(declaration)
+    name = models.extract_declaration_name(declaration)
+    _, body = models.split_signature_and_proof(declaration)
+    if keyword not in ("def", "abbrev") or not name or not body:
+      return StateManagerOutput(
+          success=False,
+          action=action,
+          error_message=(
+              "required_definitions must contain named def/abbrev templates"
+              " with bodies."
+          ),
+      )
+    if not re.search(r"\b(sorry|admit)\b", body):
+      return StateManagerOutput(
+          success=False,
+          action=action,
+          error_message=(
+              f"Required definition {name!r} must be a placeholder template;"
+              " prefilled definitions are not accepted at initialization."
+          ),
+      )
+    required_names.append(name)
+  if len(required_names) != len(set(required_names)):
+    return StateManagerOutput(
+        success=False,
+        action=action,
+        error_message="required_definitions contains duplicate names.",
+    )
+
   init_graph.environment.shared_definitions = preamble
+  init_graph.graph_metadata.update(
+      root_id=root_id,
+      root_phase=root_phase,
+      required_definitions=required_definitions,
+      required_definition_names=required_names,
+      freeze_root_plan=input_data.freeze_root_plan,
+  )
+  collisions = sorted(
+      set(required_names) & set(_existing_declared_names(init_graph))
+  )
+  if collisions:
+    return StateManagerOutput(
+        success=False,
+        action=action,
+        error_message=(
+            "Required root definitions remain in the immutable preamble: "
+            + ", ".join(collisions)
+        ),
+    )
   root_node = dag.ProofGraphNode(
       id=root_id,
       informal_problem=models.InformalProblem(statement=root_stmt),
+      search_metadata={"phase": root_phase},
   )
 
   init_graph.add_node(root_node)
@@ -3492,6 +3709,9 @@ def main(argv: List[str]) -> None:
         node_id=_NODE_ID.value,
         parent_id=_PARENT_ID.value,
         statement=_STATEMENT.value,
+        root_phase=_ROOT_PHASE.value,
+        required_definitions=_REQUIRED_DEFINITIONS.value,
+        freeze_root_plan=bool(_FREEZE_ROOT_PLAN.value),
         reason=_REASON.value,
         json_output=bool(_JSON_OUTPUT.value) if _JSON_OUTPUT.value is not None else False,
     )
@@ -3507,6 +3727,13 @@ def main(argv: List[str]) -> None:
     parser.add_argument("--node_id", type=str, default=None)
     parser.add_argument("--parent_id", type=str, default=None)
     parser.add_argument("--statement", type=str, default=None)
+    parser.add_argument(
+        "--root_phase", choices=("informal", "formal"), default="informal"
+    )
+    parser.add_argument("--required_definitions", type=str, default="")
+    parser.add_argument(
+        "--freeze_root_plan", action=argparse.BooleanOptionalAction, default=False
+    )
     parser.add_argument("--reason", type=str, default="")
     parser.add_argument(
         "--json_output", action=argparse.BooleanOptionalAction, default=False
@@ -3526,6 +3753,9 @@ def main(argv: List[str]) -> None:
         node_id=args.node_id,
         parent_id=args.parent_id,
         statement=args.statement,
+        root_phase=args.root_phase,
+        required_definitions=args.required_definitions,
+        freeze_root_plan=args.freeze_root_plan,
         reason=args.reason,
         json_output=args.json_output,
     )

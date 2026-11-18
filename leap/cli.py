@@ -358,7 +358,17 @@ def cmd_init(args) -> int:
   import install  # pylint: disable=g-import-not-at-top
   dest = os.path.abspath(os.path.expanduser(args.dest))
   _say(f"Installing LEAP agents for {args.host} into {dest}")
-  install.INSTALLERS[args.host](dest)
+  if args.host == "codex":
+    install.install_codex(
+        dest,
+        model=args.model or "",
+        reasoning_effort=args.reasoning_effort or "",
+        search_enabled=not args.disable_search,
+    )
+  else:
+    if args.model or args.reasoning_effort or args.disable_search:
+      raise ValueError("Codex pin/search options require host=codex")
+    install.INSTALLERS[args.host](dest)
   os.makedirs(os.path.join(dest, "problems"), exist_ok=True)
 
   config.apply()
@@ -431,6 +441,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("init", help="install the agents for one CLI")
     p.add_argument("host", choices=HOSTS)
     p.add_argument("--dest", default=".", help="workspace (default: here)")
+    p.add_argument("--model", help="pin every generated Codex worker model")
+    p.add_argument(
+        "--reasoning-effort",
+        help="pin every generated Codex worker reasoning effort",
+    )
+    p.add_argument(
+        "--disable-search",
+        action="store_true",
+        help="omit LEAP search skills and render a search-disabled policy",
+    )
     p.set_defaults(fn=cmd_init)
 
   p = sub.add_parser("doctor", help="check the setup")

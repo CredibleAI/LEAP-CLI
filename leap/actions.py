@@ -247,7 +247,15 @@ def declare(mgr, node_id: str, action: str, reason: str) -> Tuple[bool, str]:
     elif action == "approved":
       review_trigger.record_approval(graph, node)
 
-    pipeline.apply_action(node, action)
+    freeze_root_replan = bool(
+        action == "replan"
+        and node_id == target_root
+        and graph.graph_metadata.get("freeze_root_plan")
+    )
+    if freeze_root_replan:
+      pipeline.apply_predicate_edge(node, "frozen_root_replan", "formal")
+    else:
+      pipeline.apply_action(node, action)
 
     # Bumped for the same reason a successful submission bumps it. The
     # orchestrator can `release` a node whose worker is still compiling, and

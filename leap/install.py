@@ -259,10 +259,23 @@ def _toml_multiline(s: str) -> str:
   return json.dumps(s, ensure_ascii=False)
 
 
-def install_codex(dest: str) -> None:
+def install_codex(
+    dest: str,
+    *,
+    model: str = "",
+    reasoning_effort: str = "",
+    search_enabled: bool = True,
+) -> None:
   for meta, body in _agents():
     name = str(meta["name"])
     prompt = body.rstrip() + _notes("codex", name)
+    if not search_enabled:
+      prompt += (
+          "\n\n## Experiment search policy\n\n"
+          "Web search, LeanSearch, Loogle, apps, plugins, and external MCP"
+          " retrieval are disabled for this run. Do not invoke or recommend"
+          " them. Work only from the frozen workspace and Lean feedback."
+      )
     if name in (ORCHESTRATOR, SMOKE_TEST):
       # The orchestrator is the main session, so it ships as a skill the user
       # invokes ($leap-prove / $leap-smoke-test), not as a spawnable agent.
@@ -272,7 +285,18 @@ def install_codex(dest: str) -> None:
       _write(os.path.join(dest, ".agents", "skills", skill, "SKILL.md"),
              fm + prompt)
       continue
-    toml = (
+    pins = ""
+    if model:
+      pins += f"model = {json.dumps(model)}\n"
+    if reasoning_effort:
+      pins += (
+          "model_reasoning_effort = "
+          + json.dumps(reasoning_effort)
+          + "\n"
+      )
+    if not search_enabled:
+      pins += "features.apps = false\nfeatures.plugins = false\n"
+    toml = pins + (
         f"name = {json.dumps(name)}\n"
         f"description = {json.dumps(str(meta['description']), ensure_ascii=False)}\n"
         f"developer_instructions = {_toml_multiline(prompt)}\n"
@@ -280,6 +304,8 @@ def install_codex(dest: str) -> None:
     _write(os.path.join(dest, ".codex", "agents", f"{name}.toml"), toml)
 
   for skill in sorted(os.listdir(SKILLS_DIR)):
+    if not search_enabled and skill == "lemma_mathlib_search":
+      continue
     _copy_skill(os.path.join(SKILLS_DIR, skill),
                 os.path.join(dest, ".agents", "skills", skill), skill)
 
@@ -325,8 +351,22 @@ def main(argv: List[str]) -> int:
   parser.add_argument("--host", required=True, choices=sorted(INSTALLERS))
   parser.add_argument("--dest", default=".",
                       help="Workspace to install into (default: current dir).")
+  parser.add_argument("--model", default="")
+  parser.add_argument("--reasoning-effort", default="")
+  parser.add_argument("--disable-search", action="store_true")
   args = parser.parse_args(argv[1:])
-  INSTALLERS[args.host](os.path.abspath(os.path.expanduser(args.dest)))
+  dest = os.path.abspath(os.path.expanduser(args.dest))
+  if args.host == "codex":
+    install_codex(
+        dest,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        search_enabled=not args.disable_search,
+    )
+  else:
+    if args.model or args.reasoning_effort or args.disable_search:
+      parser.error("Codex pin/search options require --host=codex")
+    INSTALLERS[args.host](dest)
   return 0
 
 

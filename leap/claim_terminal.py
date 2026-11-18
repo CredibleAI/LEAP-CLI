@@ -70,6 +70,14 @@ def why_nothing_to_claim(graph, root_id: Optional[str]) -> str:
   if root is None:
     return "The graph has no nodes. Run `--action=init_graph` first."
 
+  terminal = graph.graph_metadata.get("terminal_state")
+  if terminal:
+    reason = graph.graph_metadata.get("terminal_reason", "")
+    return (
+        f"{str(terminal).upper()}: the trajectory reached its frozen stopping "
+        f"contract. {reason} Do not dispatch or assemble; preserve this terminal."
+    )
+
   # `_record_disproof` marks the node `decomposition_failed` on its way out, and
   # since `informal --action=failed` stopped being terminal that is now the only
   # thing that sets the flag -- so on the root it means exactly "refuted", and

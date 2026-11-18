@@ -114,6 +114,37 @@ class CodexTest(unittest.TestCase):
     self.assertIn("DISPATCH-ONLY", body)
 
 
+  @unittest.skipIf(tomllib is None, "needs Python 3.11+ for tomllib")
+  def test_workers_can_pin_model_effort_and_disable_search(self):
+    tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(tmp.cleanup)
+    with contextlib.redirect_stdout(io.StringIO()):
+      install.install_codex(
+          tmp.name,
+          model="gpt-6.1-sol",
+          reasoning_effort="low",
+          search_enabled=False,
+      )
+    for worker in _WORKERS:
+      path = os.path.join(
+          tmp.name, ".codex", "agents", worker + ".toml"
+      )
+      with open(path, "rb") as f:
+        agent = tomllib.load(f)
+      self.assertEqual(agent["model"], "gpt-6.1-sol")
+      self.assertEqual(agent["model_reasoning_effort"], "low")
+      self.assertFalse(agent["features"]["apps"])
+      self.assertFalse(agent["features"]["plugins"])
+      self.assertIn("search policy", agent["developer_instructions"].lower())
+    self.assertFalse(
+        os.path.exists(
+            os.path.join(
+                tmp.name, ".agents", "skills", "lemma_mathlib_search"
+            )
+        )
+    )
+
+
 class AntigravityTest(unittest.TestCase):
 
   def test_native_tool_names(self):
