@@ -34,6 +34,7 @@ Usage (CLI):
 """
 
 import asyncio
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -46,6 +47,11 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, overload
 import urllib.error
 import urllib.request
 import pydantic
+
+try:
+  import fcntl
+except ImportError:  # pragma: no cover - Windows has no process-shared flock.
+  fcntl = None
 
 
 try:
@@ -447,6 +453,59 @@ def _check_kimina(
   return results[0], None
 
 
+def _append_event(event: str, **fields: Any) -> None:
+  """Appends a compact experiment event without exposing environment secrets."""
+  path = os.environ.get("LEAP_EVENT_LOG", "")
+  if not path:
+    return
+  row = {
+      "schema_version": "putnam_leap_event_v1",
+      "event": event,
+      "timestamp_unix": time.time(),
+      "campaign_id": os.environ.get("LEAP_CAMPAIGN_ID", ""),
+      "cell_id": os.environ.get("LEAP_CELL_ID", ""),
+      **fields,
+  }
+  payload = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+  fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+  try:
+    os.write(fd, payload)
+  finally:
+    os.close(fd)
+
+
+@contextmanager
+def _global_lean_admission():
+  """Acquires one Slurm-job-wide file-lock slot for a local Lean process."""
+  slot_dir = os.environ.get("LEAP_LEAN_SLOT_DIR", "")
+  limit = int(os.environ.get("LEAP_MAX_LEAN_CHECKS", "0") or 0)
+  if not slot_dir or limit <= 0 or fcntl is None:
+    yield {"slot": None, "queue_wait_seconds": 0.0}
+    return
+  os.makedirs(slot_dir, exist_ok=True)
+  queued = time.monotonic()
+  while True:
+    for slot in range(limit):
+      handle = open(  # pylint: disable=consider-using-with
+          os.path.join(slot_dir, f"slot-{slot}.lock"), "a+", encoding="utf-8"
+      )
+      try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+      except BlockingIOError:
+        handle.close()
+        continue
+      waited = time.monotonic() - queued
+      _append_event("lean_slot_acquired", slot=slot, queue_wait_seconds=waited)
+      try:
+        yield {"slot": slot, "queue_wait_seconds": waited}
+      finally:
+        _append_event("lean_slot_released", slot=slot)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+      return
+    time.sleep(0.05)
+
+
 def _check_local(
     code: str, timeout: int
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -581,7 +640,8 @@ def run_lean_verifier(input_data: LeanVerifierInput) -> LeanVerifierOutput:
           ),
           remote_error=remote_err,
       )
-    res, last_err = _check_local(code, input_data.timeout)
+    with _global_lean_admission():
+      res, last_err = _check_local(code, input_data.timeout)
 
   if res is None:
     # No verdict was obtained, so this says nothing about the proof.
