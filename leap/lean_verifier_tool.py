@@ -41,10 +41,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import threading
 from typing import Any, Dict, List, Literal, Optional, Tuple, overload
 import urllib.error
 import urllib.request
@@ -508,6 +510,34 @@ def _append_event(event: str, **fields: Any) -> None:
 
 @contextmanager
 def _global_lean_admission(
+    *, check_id: Optional[str] = None, check_kind: str = "unspecified"
+):
+  """Release and journal a held slot when a CLI worker receives SIGTERM."""
+  if check_id is None:
+    identity = f"{check_kind}/{time.time_ns()}/{os.getpid()}"
+    check_id = "lean-check-" + hashlib.sha256(identity.encode()).hexdigest()
+
+  def terminate(signum, _frame):
+    _append_event(
+        "lean_check_interrupted", lean_check_id=check_id, check_kind=check_kind,
+        outcome="interrupted", signal=signum,
+    )
+    raise SystemExit(128 + signum)
+
+  install_handler = threading.current_thread() is threading.main_thread()
+  previous = signal.getsignal(signal.SIGTERM) if install_handler else None
+  if install_handler:
+    signal.signal(signal.SIGTERM, terminate)
+  try:
+    with _lean_admission_slot(check_id=check_id, check_kind=check_kind) as slot:
+      yield slot
+  finally:
+    if install_handler:
+      signal.signal(signal.SIGTERM, previous)
+
+
+@contextmanager
+def _lean_admission_slot(
     *, check_id: Optional[str] = None, check_kind: str = "unspecified"
 ):
   """Acquires one Slurm-job-wide file-lock slot for one identified Lean check."""

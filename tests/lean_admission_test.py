@@ -4,6 +4,9 @@ import _path  # noqa: F401
 import asyncio
 import json
 import os
+import signal
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import threading
@@ -15,6 +18,38 @@ import lean_verifier_tool
 
 
 class GlobalLeanAdmissionTest(unittest.TestCase):
+
+  def test_sigterm_records_interruption_and_releases_slot(self):
+    with tempfile.TemporaryDirectory() as root:
+      event_log = os.path.join(root, "events.jsonl")
+      env = dict(os.environ, LEAP_EVENT_LOG=event_log,
+                 LEAP_LEAN_SLOT_DIR=os.path.join(root, "slots"), LEAP_MAX_LEAN_CHECKS="1")
+      code = (
+          "import lean_verifier_tool as v, time\n"
+          "with v._global_lean_admission(check_id='check'):\n"
+          " print('ready', flush=True)\n"
+          " time.sleep(30)\n"
+      )
+      process = subprocess.Popen(
+          [sys.executable, "-c", code], env=env,
+          cwd=str(Path(lean_verifier_tool.__file__).parent),
+          stdout=subprocess.PIPE, text=True,
+      )
+      try:
+        self.assertEqual(process.stdout.readline().strip(), "ready")
+        process.send_signal(signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=5), 143)
+      finally:
+        if process.poll() is None:
+          process.kill()
+          process.wait()
+        process.stdout.close()
+      rows = [json.loads(line) for line in Path(event_log).read_text().splitlines()]
+      self.assertEqual([row["event"] for row in rows], [
+          "lean_check_enqueued", "lean_slot_acquired",
+          "lean_check_interrupted", "lean_slot_released",
+      ])
+      self.assertTrue(all(row["lean_check_id"] == "check" for row in rows))
 
   def test_event_identity_isolated_across_tasks_and_copied_to_threads(self):
     with tempfile.TemporaryDirectory() as root:
