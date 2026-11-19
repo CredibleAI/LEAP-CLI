@@ -1,6 +1,7 @@
 """Experiment-facing global Lean admission regressions."""
 
 import _path  # noqa: F401
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,30 @@ import lean_verifier_tool
 
 
 class GlobalLeanAdmissionTest(unittest.TestCase):
+
+  def test_event_identity_isolated_across_tasks_and_copied_to_threads(self):
+    with tempfile.TemporaryDirectory() as root:
+      event_log = os.path.join(root, "events.jsonl")
+
+      async def emit(cell):
+        with lean_verifier_tool.event_identity(
+            campaign_id="campaign", wave_id="wave", cell_id=cell
+        ):
+          await asyncio.sleep(0)
+          await asyncio.to_thread(lean_verifier_tool._append_event, "thread", expected=cell)
+          lean_verifier_tool._append_event("task", expected=cell)
+
+      async def run():
+        await asyncio.gather(emit("a"), emit("b"))
+
+      with mock.patch.dict(os.environ, {
+          "LEAP_EVENT_LOG": event_log, "LEAP_CELL_ID": "fallback"
+      }):
+        asyncio.run(run())
+        lean_verifier_tool._append_event("outside", expected="fallback")
+      events = [json.loads(line) for line in Path(event_log).read_text().splitlines()]
+      self.assertEqual(len(events), 5)
+      self.assertTrue(all(row["cell_id"] == row["expected"] for row in events))
 
   def test_file_slots_bound_overlapping_local_checks_and_emit_events(self):
     with tempfile.TemporaryDirectory() as root:

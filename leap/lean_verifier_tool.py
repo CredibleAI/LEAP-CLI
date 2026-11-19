@@ -35,6 +35,7 @@ Usage (CLI):
 
 import asyncio
 from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -454,16 +455,35 @@ def _check_kimina(
   return results[0], None
 
 
+_event_identity = ContextVar("leap_lean_event_identity", default=None)
+
+
+@contextmanager
+def event_identity(*, campaign_id: str, wave_id: str, cell_id: str):
+  """Scopes parent-process events to one async trajectory (also copied to threads)."""
+  token = _event_identity.set(dict(
+      campaign_id=campaign_id, wave_id=wave_id, cell_id=cell_id
+  ))
+  try:
+    yield
+  finally:
+    _event_identity.reset(token)
+
+
 def _append_event(event: str, **fields: Any) -> None:
   """Appends a compact experiment event without exposing environment secrets."""
   path = os.environ.get("LEAP_EVENT_LOG", "")
   if not path:
     return
+  context = _event_identity.get() or {}
+  campaign_id = context.get("campaign_id", os.environ.get("LEAP_CAMPAIGN_ID", ""))
+  wave_id = context.get("wave_id", os.environ.get("LEAP_WAVE_ID", ""))
+  cell_id = context.get("cell_id", os.environ.get("LEAP_CELL_ID", ""))
   timestamp_ns = time.time_ns()
   identity = "/".join((
-      os.environ.get("LEAP_CAMPAIGN_ID", ""),
-      os.environ.get("LEAP_WAVE_ID", ""),
-      os.environ.get("LEAP_CELL_ID", ""),
+      campaign_id,
+      wave_id,
+      cell_id,
       event,
       str(timestamp_ns),
       str(os.getpid()),
@@ -473,9 +493,9 @@ def _append_event(event: str, **fields: Any) -> None:
       "event_id": "event-" + hashlib.sha256(identity.encode()).hexdigest(),
       "event": event,
       "timestamp_unix": timestamp_ns / 1_000_000_000,
-      "campaign_id": os.environ.get("LEAP_CAMPAIGN_ID", ""),
-      "wave_id": os.environ.get("LEAP_WAVE_ID", ""),
-      "cell_id": os.environ.get("LEAP_CELL_ID", ""),
+      "campaign_id": campaign_id,
+      "wave_id": wave_id,
+      "cell_id": cell_id,
       **fields,
   }
   payload = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
